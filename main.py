@@ -20,7 +20,7 @@ import json
 load_dotenv()
 
 # Initialize Firebase Admin
-cred = credentials.Certificate("serviceAccountKey.json")
+cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
     'storageBucket': os.getenv('FIREBASE_STORAGE_BUCKET', 'eduprep-ai.appspot.com')
 })
