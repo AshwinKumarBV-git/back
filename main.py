@@ -485,27 +485,27 @@ async def summarize_resource(
             if not video_id:
                 raise HTTPException(status_code=400, detail="Invalid YouTube URL")
             
-            # Get video metadata
             try:
-                yt = YouTube(youtube_url)
+                extracted_text = get_youtube_transcript(video_id)
+                if not extracted_text:
+                    raise HTTPException(status_code=404, detail="Could not retrieve transcript for the YouTube video. It might be disabled or the video unavailable.")
+                # Set a default title if not provided
                 if not title:
-                    title = yt.title
+                    # Attempt to get video title (you might need a more robust way, e.g., using pytube)
+                    try:
+                        from pytube import YouTube
+                        yt = YouTube(youtube_url)
+                        title = yt.title
+                    except Exception as e:
+                        print(f"Could not fetch YouTube title: {e}")
+                        title = f"Summary from {video_id}"
             except Exception as e:
-                # If YouTube metadata retrieval fails, use URL as title
-                if not title:
-                    title = "YouTube Video"
-                
-            # Get transcript if available
-            try:
-                transcript = get_youtube_transcript(video_id)
-                if transcript:
-                    extracted_text = transcript
-                else:
-                    extracted_text = "No transcript available for this video."
-            except Exception as e:
-                extracted_text = f"Error retrieving transcript: {str(e)}"
-                
-            file_url = youtube_url
+                # Log the specific error for server-side diagnosis
+                print(f"Error getting YouTube transcript for {video_id}: {e}")
+                # Provide a more generic error to the client
+                raise HTTPException(status_code=500, detail=f"Failed to process YouTube video: {e}")
+            file_url = youtube_url  # Ensure this line is present
+            
         else:
             raise HTTPException(status_code=400, detail="Either file or YouTube URL must be provided")
         
@@ -809,26 +809,26 @@ async def generate_quiz_from_file(
             if not video_id:
                 raise HTTPException(status_code=400, detail="Invalid YouTube URL")
             
-            # Get video metadata
             try:
-                yt = YouTube(youtube_url)
+                extracted_text = get_youtube_transcript(video_id)
+                if not extracted_text:
+                    raise HTTPException(status_code=404, detail="Could not retrieve transcript for the YouTube video. It might be disabled or the video unavailable.")
+                # Set a default title if not provided
                 if not title:
-                    title = yt.title
+                    # Attempt to get video title (you might need a more robust way, e.g., using pytube)
+                    try:
+                        from pytube import YouTube
+                        yt = YouTube(youtube_url)
+                        title = yt.title
+                    except Exception as e:
+                        print(f"Could not fetch YouTube title: {e}")
+                        title = f"Quiz from {video_id}"
             except Exception as e:
-                # If YouTube metadata retrieval fails, use URL as title
-                if not title:
-                    title = "YouTube Video"
-                
-            # Get transcript if available
-            try:
-                transcript = get_youtube_transcript(video_id)
-                if transcript:
-                    extracted_text = transcript
-                else:
-                    extracted_text = "No transcript available for this video."
-            except Exception as e:
-                extracted_text = f"Error retrieving transcript: {str(e)}"
-                
+                # Log the specific error for server-side diagnosis
+                print(f"Error getting YouTube transcript for {video_id}: {e}")
+                # Provide a more generic error to the client
+                raise HTTPException(status_code=500, detail=f"Failed to process YouTube video: {e}")
+
             file_url = youtube_url
         else:
             raise HTTPException(status_code=400, detail="Either file or YouTube URL must be provided")
