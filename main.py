@@ -174,6 +174,13 @@ Format the response in markdown."""
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+#simple loadtest endpoint
+
+@app.get("/")
+async def health_check():
+    return {"status": "ok"}
+
+
 @app.post("/api/v1/speech-to-plan", response_model=SpeechToPlanResponse)
 async def generate_speech_to_plan(request: SpeechToPlanRequest):
     uid = await verify_token(request.token) # Verify token from request body
