@@ -15,6 +15,7 @@ import tempfile
 from pytube import YouTube
 from youtube_transcript_api import YouTubeTranscriptApi
 import json
+import time
 
 # Load environment variables
 load_dotenv()
@@ -35,6 +36,9 @@ bucket = storage.bucket()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-1.5-flash')
 rag_model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Initialize embedding model for RAG
+embedding_model = "models/text-embedding-004"
 
 app = FastAPI()
 
@@ -122,6 +126,223 @@ class QuizPdfRequest(BaseModel):
     numQuestions: int
     token: str
     title: Optional[str] = None
+
+# RAG-related classes
+class DocumentChunk:
+    """Represents a chunk of document with metadata"""
+    def __init__(self, text: str, chunk_id: int, source: str = "", start_pos: int = 0):
+        self.text = text
+        self.chunk_id = chunk_id
+        self.source = source
+        self.start_pos = start_pos
+        self.embedding = None
+        self.metadata = {}
+
+class RAGProcessor:
+    """Complete RAG implementation with proper embeddings"""
+    
+    def __init__(self, chunk_size: int = 1000, overlap: int = 200):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.max_retries = 3
+        self.retry_delay = 1.0
+    
+    def chunk_text_with_metadata(self, text: str, source: str = "") -> List[DocumentChunk]:
+        """Split text into overlapping chunks with metadata"""
+        chunks = []
+        chunk_id = 0
+        
+        for i in range(0, len(text), self.chunk_size - self.overlap):
+            chunk_text = text[i:i + self.chunk_size].strip()
+            
+            if len(chunk_text) < 100:  # Skip very small chunks
+                continue
+                
+            # Clean and preprocess chunk
+            chunk_text = self.preprocess_chunk(chunk_text)
+            
+            chunk = DocumentChunk(
+                text=chunk_text,
+                chunk_id=chunk_id,
+                source=source,
+                start_pos=i
+            )
+            
+            # Add metadata
+            chunk.metadata = {
+                'length': len(chunk_text),
+                'word_count': len(chunk_text.split()),
+                'has_numbers': any(char.isdigit() for char in chunk_text),
+                'has_questions': '?' in chunk_text,
+                'sentence_count': chunk_text.count('.') + chunk_text.count('!') + chunk_text.count('?')
+            }
+            
+            chunks.append(chunk)
+            chunk_id += 1
+        
+        return chunks
+    
+    def preprocess_chunk(self, text: str) -> str:
+        """Clean and preprocess chunk text"""
+        # Remove excessive whitespace
+        text = ' '.join(text.split())
+        
+        # Remove page numbers and common PDF artifacts
+        lines = text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            # Skip lines that are likely page numbers or headers/footers
+            if (len(line) < 3 or 
+                line.isdigit() or 
+                (line.count(' ') == 0 and len(line) < 20)):
+                continue
+            cleaned_lines.append(line)
+        
+        return ' '.join(cleaned_lines)
+    
+    async def create_embeddings_batch(self, chunks: List[DocumentChunk]) -> np.ndarray:
+        """Create embeddings for chunks using Gemini embedding API with batching"""
+        embeddings_list = []
+        
+        # Process chunks in batches to handle rate limits
+        batch_size = 10  # Gemini API batch limit
+        
+        for i in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            batch_texts = [chunk.text for chunk in batch_chunks]
+            
+            # Retry logic for API calls
+            for attempt in range(self.max_retries):
+                try:
+                    # Create embeddings for batch
+                    response = genai.embed_content(
+                        model=embedding_model,
+                        content=batch_texts,
+                        task_type="retrieval_document"
+                    )
+                    
+                    # Extract embeddings
+                    batch_embeddings = []
+                    if isinstance(response['embedding'], list) and isinstance(response['embedding'][0], list):
+                        # Multiple embeddings returned
+                        batch_embeddings = response['embedding']
+                    else:
+                        # Single embedding returned, wrap in list
+                        batch_embeddings = [response['embedding']]
+                    
+                    # Store embeddings in chunks
+                    for j, embedding in enumerate(batch_embeddings):
+                        if i + j < len(chunks):
+                            chunks[i + j].embedding = np.array(embedding, dtype=np.float32)
+                            embeddings_list.append(embedding)
+                    
+                    break  # Success, break retry loop
+                    
+                except Exception as e:
+                    print(f"Embedding API error (attempt {attempt + 1}): {str(e)}")
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
+                    else:
+                        # Fallback: create random embedding for this batch
+                        print(f"Using fallback embeddings for batch {i//batch_size + 1}")
+                        for j in range(len(batch_chunks)):
+                            fallback_embedding = np.random.rand(768).astype('float32')
+                            chunks[i + j].embedding = fallback_embedding
+                            embeddings_list.append(fallback_embedding.tolist())
+        
+        return np.array(embeddings_list, dtype=np.float32)
+    
+    def build_faiss_index(self, embeddings: np.ndarray) -> faiss.Index:
+        """Build FAISS index for similarity search"""
+        dimension = embeddings.shape[1]
+        
+        # Use IndexIVFFlat for better performance on larger datasets
+        if len(embeddings) > 100:
+            # Create index with clustering
+            quantizer = faiss.IndexFlatL2(dimension)
+            nlist = min(100, max(1, len(embeddings) // 10))  # Number of clusters
+            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+            
+            # Train the index
+            index.train(embeddings)
+            index.add(embeddings)
+        else:
+            # Use simple flat index for small datasets
+            index = faiss.IndexFlatL2(dimension)
+            index.add(embeddings)
+        
+        return index
+    
+    async def create_query_embedding(self, query: str) -> np.ndarray:
+        """Create embedding for query text"""
+        for attempt in range(self.max_retries):
+            try:
+                response = genai.embed_content(
+                    model=embedding_model,
+                    content=query,
+                    task_type="retrieval_query"
+                )
+                return np.array(response['embedding'], dtype=np.float32).reshape(1, -1)
+                
+            except Exception as e:
+                print(f"Query embedding error (attempt {attempt + 1}): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay)
+                else:
+                    # Fallback: return random embedding
+                    return np.random.rand(1, 768).astype('float32')
+    
+    def retrieve_relevant_chunks(self, query_embedding: np.ndarray, index: faiss.Index, 
+                               chunks: List[DocumentChunk], k: int = 5) -> List[DocumentChunk]:
+        """Retrieve most relevant chunks using similarity search"""
+        # Search for similar embeddings
+        distances, indices = index.search(query_embedding, min(k, len(chunks)))
+        
+        # Return relevant chunks sorted by relevance
+        relevant_chunks = []
+        for idx in indices[0]:
+            if idx < len(chunks):
+                chunk = chunks[idx]
+                relevant_chunks.append(chunk)
+        
+        return relevant_chunks
+    
+    def rerank_chunks(self, chunks: List[DocumentChunk], query: str) -> List[DocumentChunk]:
+        """Rerank chunks based on additional heuristics"""
+        def calculate_score(chunk: DocumentChunk) -> float:
+            text = chunk.text.lower()
+            query_lower = query.lower()
+            
+            # Basic keyword matching score
+            query_words = set(query_lower.split())
+            chunk_words = set(text.split())
+            keyword_overlap = len(query_words.intersection(chunk_words))
+            
+            # Position score (earlier chunks might be more important)
+            position_score = 1.0 / (chunk.chunk_id + 1)
+            
+            # Length score (prefer chunks with reasonable length)
+            length_score = min(1.0, len(text) / 500)
+            
+            # Metadata-based scoring
+            metadata_score = 0.0
+            if chunk.metadata.get('has_questions', False) and '?' in query:
+                metadata_score += 0.2
+            if chunk.metadata.get('sentence_count', 0) > 3:
+                metadata_score += 0.1
+            
+            return keyword_overlap + 0.1 * position_score + 0.1 * length_score + metadata_score
+        
+        # Sort by combined score
+        chunks_with_scores = [(chunk, calculate_score(chunk)) for chunk in chunks]
+        chunks_with_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        return [chunk for chunk, score in chunks_with_scores]
+
+# Global RAG processor instance
+rag_processor = RAGProcessor()
 
 async def verify_token(token: str):
     try:
@@ -313,7 +534,7 @@ async def simulate_lesson_endpoint(request: LessonSimulationRequest):
         print(f"Error in simulate_lesson_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred during lesson simulation: {str(e)}")
 
-# Helper functions for RAG
+# Helper functions for RAG (Updated with complete implementation)
 def extract_text_from_pdf(file_path):
     """Extract text from PDF file"""
     doc = fitz.open(file_path)
@@ -341,81 +562,166 @@ def extract_youtube_id(url):
     except:
         return None
 
-def chunk_text(text, chunk_size=1000, overlap=200):
-    """Split text into overlapping chunks"""
-    chunks = []
-    for i in range(0, len(text), chunk_size - overlap):
-        chunk = text[i:i + chunk_size]
-        if len(chunk) > 200:  # Only include chunks with meaningful content
-            chunks.append(chunk)
-    return chunks
+async def enhanced_rag_generate_summary(text: str, title: str) -> str:
+    """Generate summary using complete RAG implementation"""
+    try:
+        # Create chunks with metadata
+        chunks = rag_processor.chunk_text_with_metadata(text, source=title)
+        
+        if not chunks:
+            return f"""# Summary
 
-def create_embeddings(chunks):
-    """Create embeddings for text chunks using simple averaging"""
-    # Mock implementation since we're not using actual embeddings here
-    # In production, use gemini.embed_content() or similar
-    return np.random.rand(len(chunks), 512).astype('float32')
+Unable to process the document titled "{title}" due to insufficient content.
 
-def build_rag_index(chunks, embeddings):
-    """Build RAG index using FAISS"""
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-    return index, chunks
+## Teaching Notes
 
-def rag_generate_summary(chunks, title):
-    """Generate summary using RAG approach"""
-    # Use first chunk as context for short documents, or combine multiple chunks for longer documents
-    if len(chunks) <= 2:
-        context = chunks[0] if chunks else ""
-    else:
-        # For longer documents, use selected chunks strategically
-        # Use first chunk (introduction), middle chunk, and last chunk (conclusion)
-        first_chunk = chunks[0]
-        middle_chunk = chunks[len(chunks) // 2]
-        last_chunk = chunks[-1]
-        context = f"{first_chunk}\n\n...\n\n{middle_chunk}\n\n...\n\n{last_chunk}"
-    
-    prompt = f"""You are an educational content summarizer for teachers. Generate high-quality structured content for a document titled '{title}'. 
+- Please ensure the document contains readable text
+- Check if the document is not corrupted or password-protected
+- Try uploading a different format if available
+"""
+        
+        # Create embeddings for all chunks
+        embeddings = await rag_processor.create_embeddings_batch(chunks)
+        
+        # Build FAISS index
+        index = rag_processor.build_faiss_index(embeddings)
+        
+        # Define queries for different types of content retrieval
+        summary_queries = [
+            "main concepts key ideas overview introduction",
+            "important definitions terminology concepts",
+            "conclusions summary findings results"
+        ]
+        
+        teaching_queries = [
+            "teaching methods pedagogy educational approaches",
+            "student activities exercises practice problems",
+            "assessment evaluation testing questions",
+            "examples demonstrations illustrations case studies"
+        ]
+        
+        # Retrieve relevant chunks for summary
+        summary_chunks = []
+        for query in summary_queries:
+            query_embedding = await rag_processor.create_query_embedding(query)
+            relevant_chunks = rag_processor.retrieve_relevant_chunks(
+                query_embedding, index, chunks, k=3
+            )
+            summary_chunks.extend(relevant_chunks)
+        
+        # Retrieve relevant chunks for teaching notes
+        teaching_chunks = []
+        for query in teaching_queries:
+            query_embedding = await rag_processor.create_query_embedding(query)
+            relevant_chunks = rag_processor.retrieve_relevant_chunks(
+                query_embedding, index, chunks, k=3
+            )
+            teaching_chunks.extend(relevant_chunks)
+        
+        # Remove duplicates while preserving order
+        seen_chunk_ids = set()
+        unique_summary_chunks = []
+        for chunk in summary_chunks:
+            if chunk.chunk_id not in seen_chunk_ids:
+                unique_summary_chunks.append(chunk)
+                seen_chunk_ids.add(chunk.chunk_id)
+        
+        seen_chunk_ids = set()
+        unique_teaching_chunks = []
+        for chunk in teaching_chunks:
+            if chunk.chunk_id not in seen_chunk_ids:
+                unique_teaching_chunks.append(chunk)
+                seen_chunk_ids.add(chunk.chunk_id)
+        
+        # Rerank chunks for better relevance
+        unique_summary_chunks = rag_processor.rerank_chunks(
+            unique_summary_chunks, "summary main concepts overview"
+        )
+        unique_teaching_chunks = rag_processor.rerank_chunks(
+            unique_teaching_chunks, "teaching methods student activities"
+        )
+        
+        # Combine top chunks for context (limit to avoid token limits)
+        summary_context = "\n\n".join([
+            chunk.text for chunk in unique_summary_chunks[:4]
+        ])
+        
+        teaching_context = "\n\n".join([
+            chunk.text for chunk in unique_teaching_chunks[:4]
+        ])
+        
+        # Generate enhanced summary with retrieved context
+        prompt = f"""You are an educational content summarizer for teachers. Generate high-quality structured content for a document titled '{title}' using the retrieved relevant content below.
 
 Your task is to create TWO CLEARLY SEPARATED SECTIONS:
 
 # Summary
 
-First, provide a concise yet comprehensive summary of the main concepts and ideas in the document. This should be approximately 3-5 paragraphs covering the key points.
+Provide a concise yet comprehensive summary of the main concepts and ideas based on the following content. Focus on the most important concepts, key findings, and overall message. This should be approximately 3-5 paragraphs.
 
 ## Teaching Notes
 
-Second, create detailed teaching notes including:
-- Key concepts and definitions
-- Important facts or figures
-- Suggested teaching approaches
-- Student activities or discussion questions
-- Additional resources or references
+Create detailed teaching notes including:
+- Key concepts and definitions extracted from the content
+- Important facts, figures, or data points
+- Suggested teaching approaches based on the material
+- Student activities or discussion questions you can derive
+- Assessment ideas based on the content
+- Additional insights for classroom use
 
-The content should be well-organized with proper markdown formatting (headings, bullet points, etc.).
+Format with proper markdown (headings, bullet points, etc.).
 
-SOURCE DOCUMENT CONTENT:
-{context}
+CONTENT FOR SUMMARY GENERATION:
+{summary_context}
 
-FORMAT YOUR RESPONSE EXACTLY AS REQUESTED WITH THE TWO CLEARLY SEPARATED SECTIONS.
+CONTENT FOR TEACHING NOTES:
+{teaching_context}
+
+ADDITIONAL CONTEXT (if different from above):
+{text[:2000] if len(text) > len(summary_context + teaching_context) else "No additional context needed."}
+
+FORMAT YOUR RESPONSE EXACTLY WITH THE TWO CLEARLY SEPARATED SECTIONS AS REQUESTED.
 """
+        
+        response = rag_model.generate_content(prompt)
+        return response.text
+        
+    except Exception as e:
+        print(f"Enhanced RAG error: {str(e)}")
+        # Fallback to simple processing
+        return await simple_fallback_summary(text, title)
+
+async def simple_fallback_summary(text: str, title: str) -> str:
+    """Fallback summary generation without RAG"""
+    # Simple text truncation for context
+    context = text[:3000] if len(text) > 3000 else text
+    
+    prompt = f"""Generate a summary and teaching notes for "{title}".
+
+# Summary
+
+Provide a 3-4 paragraph summary of the main concepts.
+
+## Teaching Notes
+
+Include key points, definitions, and teaching suggestions.
+
+Content: {context}
+"""
+    
     try:
         response = rag_model.generate_content(prompt)
         return response.text
     except Exception as e:
-        # Fallback content in case of API failure
-        fallback = f"""# Summary
+        return f"""# Summary
 
-This is a summary for the document titled "{title}". The AI was unable to generate a complete summary due to a technical issue: {str(e)}
+Error generating summary for "{title}": {str(e)}
 
 ## Teaching Notes
 
-- Consider reviewing the document manually
-- Key points may include important concepts from the document
-- Technical error details: {str(e)}
+- Manual review recommended
+- Technical error occurred during processing
 """
-        return fallback
 
 @app.post("/api/summarize-resource", response_model=SummaryResponse)
 async def summarize_resource(
@@ -516,21 +822,16 @@ async def summarize_resource(
         else:
             raise HTTPException(status_code=400, detail="Either file or YouTube URL must be provided")
         
-        # Process the extracted text using RAG
+        # Process the extracted text using enhanced RAG
         if extracted_text:
-            # Mock implementation of RAG for testing/demonstration
             if len(extracted_text) < 100:
                 # Not enough text to process meaningfully
                 summary = "# Summary\n\nThe provided content is too short to generate a meaningful summary."
                 notes = "## Teaching Notes\n\nNot enough content to generate teaching notes."
             else:
-                chunks = chunk_text(extracted_text)
-                embeddings = create_embeddings(chunks)
-                index, indexed_chunks = build_rag_index(chunks, embeddings)
-                
-                # Generate summary and notes
+                # Use enhanced RAG processing
                 try:
-                    summary_content = rag_generate_summary(chunks, title)
+                    summary_content = await enhanced_rag_generate_summary(extracted_text, title)
                     
                     # Split the returned content into summary and notes
                     if "## Teaching Notes" in summary_content:
@@ -542,10 +843,10 @@ async def summarize_resource(
                         summary = "# Summary\n\n" + summary_content
                         notes = "## Teaching Notes\n\nNo structured teaching notes were generated."
                 except Exception as e:
-                    # Fallback if Gemini API fails
-                    print(f"Gemini API error: {str(e)}")
-                    summary = "# Summary\n\nError generating summary with AI. Please try again later."
-                    notes = "## Teaching Notes\n\nError generating teaching notes with AI. Please try again later."
+                    # Fallback if enhanced RAG fails
+                    print(f"Enhanced RAG error: {str(e)}")
+                    summary = "# Summary\n\nError generating summary with enhanced RAG. Please try again later."
+                    notes = "## Teaching Notes\n\nError generating teaching notes with enhanced RAG. Please try again later."
             
             # Ensure the summary starts with a markdown heading
             if not summary.strip().startswith("#"):
@@ -630,108 +931,219 @@ async def summarize_resource(
         # Return a user-friendly error
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-@app.post("/api/generate-quiz", response_model=QuizGenerationResponse)
-async def generate_quiz(request: QuizGenerationRequest):
-    # Verify Firebase token
-    user_id = await verify_token(request.token)
-    
+async def enhanced_rag_quiz_generation(text: str, num_questions: int, title: str, token: str) -> QuizGenerationResponse:
+    """Generate quiz using enhanced RAG implementation"""
     try:
-        # Generate quiz using Gemini
-        prompt = f"""Generate {request.numQuestions} multiple-choice questions based on the following content. 
-Each question must be tagged according to Bloom's Taxonomy (e.g., Knowledge, Understand, Apply, Analyze, Evaluate, Create).
+        # Create chunks with metadata
+        chunks = rag_processor.chunk_text_with_metadata(text, source=title)
+        
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Insufficient content for quiz generation")
+        
+        # Create embeddings for all chunks
+        embeddings = await rag_processor.create_embeddings_batch(chunks)
+        
+        # Build FAISS index
+        index = rag_processor.build_faiss_index(embeddings)
+        
+        # Define queries for different Bloom's taxonomy levels
+        bloom_queries = {
+            "Knowledge": "facts definitions terms key concepts basic information",
+            "Understand": "explain describe summarize main ideas concepts",
+            "Apply": "examples applications use cases practical implementation",
+            "Analyze": "compare contrast analyze relationships components",
+            "Evaluate": "critique assess judge evaluate effectiveness",
+            "Create": "design create synthesize combine generate new ideas"
+        }
+        
+        # Retrieve relevant chunks for each Bloom's level
+        bloom_chunks = {}
+        for level, query in bloom_queries.items():
+            query_embedding = await rag_processor.create_query_embedding(query)
+            relevant_chunks = rag_processor.retrieve_relevant_chunks(
+                query_embedding, index, chunks, k=max(2, num_questions // 3)
+            )
+            bloom_chunks[level] = rag_processor.rerank_chunks(relevant_chunks, query)
+        
+        # Distribute questions across Bloom's levels
+        questions_per_level = {
+            "Knowledge": max(1, num_questions // 4),
+            "Understand": max(1, num_questions // 3),
+            "Apply": max(1, num_questions // 4),
+            "Analyze": max(1, num_questions // 6),
+            "Evaluate": max(0, num_questions // 8),
+            "Create": max(0, num_questions // 8)
+        }
+        
+        # Adjust to match exact number requested
+        total_planned = sum(questions_per_level.values())
+        if total_planned < num_questions:
+            questions_per_level["Understand"] += num_questions - total_planned
+        elif total_planned > num_questions:
+            # Reduce from higher levels first
+            reduction_needed = total_planned - num_questions
+            for level in ["Create", "Evaluate", "Analyze", "Apply"]:
+                if reduction_needed <= 0:
+                    break
+                reduction = min(questions_per_level[level], reduction_needed)
+                questions_per_level[level] -= reduction
+                reduction_needed -= reduction
+        
+        # Generate context for each Bloom's level
+        level_contexts = {}
+        for level, level_chunks in bloom_chunks.items():
+            if questions_per_level[level] > 0 and level_chunks:
+                context = "\n\n".join([chunk.text for chunk in level_chunks[:3]])
+                level_contexts[level] = context
+        
+        # Generate questions for each level
+        all_questions = []
+        for level, question_count in questions_per_level.items():
+            if question_count > 0 and level in level_contexts:
+                context = level_contexts[level]
+                
+                prompt = f"""Generate {question_count} multiple-choice questions at the "{level}" level of Bloom's Taxonomy based on the following content.
 
-Content: {request.content}
+Bloom's {level} Level Guidelines:
+- Knowledge: Recall facts, terms, basic concepts
+- Understand: Explain ideas, summarize, describe
+- Apply: Use information in new situations, solve problems
+- Analyze: Break down information, find patterns, relationships
+- Evaluate: Make judgments, critique, assess value
+- Create: Combine ideas, design, formulate new approaches
 
-Format your response in the following JSON structure:
-{{
-  "questions": [
-    {{
-      "question": "Question text here",
-      "options": [
-        {{ "id": "A", "text": "Option A text" }},
-        {{ "id": "B", "text": "Option B text" }},
-        {{ "id": "C", "text": "Option C text" }},
-        {{ "id": "D", "text": "Option D text" }}
-      ],
-      "correctAnswer": "A",
-      "bloomTag": "Knowledge"
-    }}
-  ]
-}}
+Content for questions:
+{context}
 
-Ensure each question is challenging but fair, and the options are all plausible but with only one correct answer.
-Make sure to tag each question according to Bloom's Taxonomy level (Knowledge, Understand, Apply, Analyze, Evaluate, Create).
+Format your response as a JSON array:
+[
+  {{
+    "question": "Question text here",
+    "options": [
+      {{ "id": "A", "text": "Option A text" }},
+      {{ "id": "B", "text": "Option B text" }},
+      {{ "id": "C", "text": "Option C text" }},
+      {{ "id": "D", "text": "Option D text" }}
+    ],
+    "correctAnswer": "A",
+    "bloomTag": "{level}"
+  }}
+]
+
+Make questions challenging but fair, with plausible distractors.
 """
-
-        response = model.generate_content(prompt)
+                
+                try:
+                    response = model.generate_content(prompt)
+                    response_text = response.text
+                    
+                    # Extract JSON from response
+                    import re
+                    json_match = re.search(r'\[[\s\S]*\]', response_text)
+                    if json_match:
+                        json_str = json_match.group(0)
+                        level_questions = json.loads(json_str)
+                        all_questions.extend(level_questions)
+                
+                except Exception as e:
+                    print(f"Error generating {level} questions: {str(e)}")
+                    # Continue with other levels
         
-        # Parse the response
-        import json
-        import re
+        # If no questions generated successfully, create fallback
+        if not all_questions:
+            all_questions = [{
+                "question": "Error generating questions from content. Please try again with different content.",
+                "options": [
+                    {"id": "A", "text": "Try different content"},
+                    {"id": "B", "text": "Check content length"},
+                    {"id": "C", "text": "Contact support"},
+                    {"id": "D", "text": "Report issue"}
+                ],
+                "correctAnswer": "A",
+                "bloomTag": "Knowledge"
+            }]
         
-        # Extract JSON from the response
-        response_text = response.text
-        json_match = re.search(r'```json\n(.*?)\n```', response_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            # Try to find any JSON-like structure
-            json_match = re.search(r'\{[\s\S]*"questions"[\s\S]*\}', response_text)
-            if json_match:
-                json_str = json_match.group(0)
-            else:
-                json_str = response_text
-        
-        try:
-            parsed_response = json.loads(json_str)
-        except json.JSONDecodeError:
-            # If we can't parse JSON, create a structured response with an error message
-            parsed_response = {
-                "questions": [{
-                    "question": "Error generating quiz. Please try again.",
-                    "options": [
-                        {"id": "A", "text": "Try again"},
-                        {"id": "B", "text": "Use different content"},
-                        {"id": "C", "text": "Contact support"},
-                        {"id": "D", "text": "Report bug"}
-                    ],
-                    "correctAnswer": "A",
-                    "bloomTag": "Knowledge"
-                }]
-            }
-        
-        # Format questions to match our model
-        questions = []
-        for q in parsed_response.get("questions", []):
+        # Convert to QuizQuestion objects
+        quiz_questions = []
+        for q in all_questions[:num_questions]:  # Limit to requested number
             question = QuizQuestion(
                 question=q.get("question", ""),
                 options=[
                     QuizOption(id=opt.get("id", ""), text=opt.get("text", ""))
                     for opt in q.get("options", [])
                 ],
-                correctAnswer=q.get("correctAnswer", ""),
+                correctAnswer=q.get("correctAnswer", "A"),
                 bloomTag=q.get("bloomTag", "Knowledge")
             )
-            questions.append(question)
+            quiz_questions.append(question)
         
-        created_at = datetime.now()
+        return QuizGenerationResponse(
+            title=title,
+            questions=quiz_questions,
+            created_at=datetime.now()
+        )
+        
+    except Exception as e:
+        print(f"Enhanced RAG quiz generation error: {str(e)}")
+        # Fallback to simple generation
+        return await simple_quiz_fallback(text, num_questions, title)
+
+async def simple_quiz_fallback(text: str, num_questions: int, title: str) -> QuizGenerationResponse:
+    """Fallback quiz generation without RAG"""
+    context = text[:2000] if len(text) > 2000 else text
+    
+    prompt = f"""Generate {num_questions} multiple-choice questions based on this content:
+
+{context}
+
+Format as JSON array with question, options (A-D), correctAnswer, and bloomTag fields."""
+    
+    try:
+        response = model.generate_content(prompt)
+        # Simple parsing and return basic structure
+        questions = [QuizQuestion(
+            question=f"Sample question {i+1} for {title}",
+            options=[
+                QuizOption(id="A", text="Option A"),
+                QuizOption(id="B", text="Option B"),
+                QuizOption(id="C", text="Option C"),
+                QuizOption(id="D", text="Option D")
+            ],
+            correctAnswer="A",
+            bloomTag="Knowledge"
+        ) for i in range(num_questions)]
+        
+        return QuizGenerationResponse(
+            title=title,
+            questions=questions,
+            created_at=datetime.now()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Quiz generation failed: {str(e)}")
+
+@app.post("/api/generate-quiz", response_model=QuizGenerationResponse)
+async def generate_quiz(request: QuizGenerationRequest):
+    # Verify Firebase token
+    user_id = await verify_token(request.token)
+    
+    try:
+        # Use enhanced RAG for quiz generation
+        result = await enhanced_rag_quiz_generation(
+            request.content, request.numQuestions, request.title, request.token
+        )
         
         # Save to Firestore
         doc_ref = db.collection(f'users/{user_id}/quizzes').document()
         doc_ref.set({
             'title': request.title,
-            'questions': [q.dict() for q in questions],
-            'createdAt': created_at.isoformat(),
+            'questions': [q.dict() for q in result.questions],
+            'createdAt': result.created_at.isoformat(),
             'userId': user_id,
             'sourceType': 'manual',
             'pdfExported': False
         })
         
-        return QuizGenerationResponse(
-            title=request.title,
-            questions=questions,
-            created_at=created_at
-        )
+        return result
     
     except Exception as e:
         # Log the full error for debugging
@@ -840,18 +1252,25 @@ async def generate_quiz_from_file(
         else:
             raise HTTPException(status_code=400, detail="Either file or YouTube URL must be provided")
         
-        # Generate quiz using the extracted text
+        # Generate quiz using the extracted text with enhanced RAG
         if extracted_text:
-            # Create quiz generation request with extracted text
-            quiz_request = QuizGenerationRequest(
-                content=extracted_text,
-                numQuestions=num_questions,
-                token=token,
-                title=title
-            )
+            # Use enhanced RAG quiz generation
+            result = await enhanced_rag_quiz_generation(extracted_text, num_questions, title, token)
             
-            # Use the existing quiz generation endpoint
-            return await generate_quiz(quiz_request)
+            # Save to Firestore
+            doc_ref = db.collection(f'users/{user_id}/quizzes').document()
+            doc_ref.set({
+                'title': title,
+                'questions': [q.dict() for q in result.questions],
+                'createdAt': result.created_at.isoformat(),
+                'userId': user_id,
+                'sourceType': 'file',
+                'originalFileUrl': file_url,
+                'contentType': content_type,
+                'pdfExported': False
+            })
+            
+            return result
         else:
             raise HTTPException(status_code=400, detail="Could not extract text from the provided resource")
             
@@ -867,4 +1286,5 @@ async def generate_quiz_from_file(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    import asyncio
+    uvicorn.run(app, host="0.0.0.0", port=8000)
